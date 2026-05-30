@@ -8,7 +8,7 @@ import os
 import sys
 from pathlib import Path
 
-from .binaries import detect_h264_encoder, ffprobe_for, find_binary
+from .binaries import ffprobe_for, find_binary, test_h264_encoders
 
 
 def config_dir() -> Path:
@@ -37,16 +37,37 @@ class AppState:
             "concurrency": 1,
             "allow_playlist": False,
             "items": [],          # [{url, mode, force_h264}]
+            "encoder": "",                 # chosen H.264 encoder id
+            "available_encoders": [],      # tested-working encoders
         }
         self.load()
         self.refresh_binaries()
 
     # -- binaries ---------------------------------------------------------- #
     def refresh_binaries(self) -> None:
+        """Cheap: locate paths only. Encoder testing is separate (detect_encoders)
+        because it runs ffmpeg and is slower."""
         self.ytdlp = find_binary("yt-dlp", self.data.get("ytdlp_path") or None)
         self.ffmpeg = find_binary("ffmpeg", self.data.get("ffmpeg_path") or None)
         self.ffprobe = ffprobe_for(self.ffmpeg)
-        self.encoder = detect_h264_encoder(self.ffmpeg)
+        # Use the saved choice if any; otherwise a safe default until detection.
+        self.encoder = self.data.get("encoder") or "libx264"
+
+    def detect_encoders(self) -> list[str]:
+        """Test which H.264 encoders actually work and remember the result.
+        Returns the working list (best first)."""
+        working = test_h264_encoders(self.ffmpeg)
+        self.data["available_encoders"] = working
+        if self.data.get("encoder") not in working:
+            self.data["encoder"] = working[0]
+        self.encoder = self.data["encoder"]
+        self.save()
+        return working
+
+    def set_encoder(self, encoder: str) -> None:
+        self.data["encoder"] = encoder
+        self.encoder = encoder
+        self.save()
 
     def binaries_ok(self) -> tuple[bool, str]:
         missing = []

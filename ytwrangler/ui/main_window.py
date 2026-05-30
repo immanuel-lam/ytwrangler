@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 from PySide6.QtWidgets import (
-    QDialog, QFileDialog, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
-    QPlainTextEdit, QPushButton, QSplitter, QTabWidget, QVBoxLayout, QWidget,
+    QComboBox, QDialog, QFileDialog, QHBoxLayout, QLabel, QLineEdit,
+    QMainWindow, QPlainTextEdit, QPushButton, QSplitter, QTabWidget,
+    QVBoxLayout, QWidget,
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QThreadPool
 
+from ..binaries import ENCODER_LABELS
 from ..session import AppState
+from ..workers import FnWorker
 from .batch_tab import BatchTab
 from .single_tab import SingleTab
 
@@ -65,6 +68,7 @@ class MainWindow(QMainWindow):
     def __init__(self, state: AppState) -> None:
         super().__init__()
         self.state = state
+        self.pool = QThreadPool()
         self.setWindowTitle("ytwrangler")
         self.resize(900, 680)
 
@@ -91,6 +95,13 @@ class MainWindow(QMainWindow):
         ok, msg = state.binaries_ok()
         self.log(msg if ok else f"⚠ {msg} — set paths via Settings.")
 
+        # Populate the encoder dropdown; test encoders in the background if we
+        # haven't already cached the results for this machine.
+        if state.data.get("available_encoders"):
+            self._populate_encoders(state.data["available_encoders"])
+        elif ok:
+            self._detect_encoders()
+
     def _top_bar(self) -> QWidget:
         bar = QWidget()
         row = QHBoxLayout(bar)
@@ -100,10 +111,58 @@ class MainWindow(QMainWindow):
         self.status_label.setStyleSheet(
             "color:#1f9d55;" if ok else "color:#d23;")
         row.addWidget(self.status_label, 1)
+
+        row.addWidget(QLabel("Encoder:"))
+        self.encoder_combo = QComboBox()
+        self.encoder_combo.setMinimumWidth(170)
+        self.encoder_combo.currentIndexChanged.connect(self._encoder_changed)
+        row.addWidget(self.encoder_combo)
+        self.redetect_btn = QPushButton("Re-detect")
+        self.redetect_btn.clicked.connect(self._detect_encoders)
+        row.addWidget(self.redetect_btn)
+
         settings = QPushButton("Settings…")
         settings.clicked.connect(self._open_settings)
         row.addWidget(settings)
         return bar
+
+    # -- encoder picker ---------------------------------------------------- #
+    def _populate_encoders(self, encoders: list[str]) -> None:
+        self.encoder_combo.blockSignals(True)
+        self.encoder_combo.clear()
+        for enc in encoders:
+            self.encoder_combo.addItem(ENCODER_LABELS.get(enc, enc), enc)
+        idx = self.encoder_combo.findData(self.state.encoder)
+        if idx >= 0:
+            self.encoder_combo.setCurrentIndex(idx)
+        self.encoder_combo.blockSignals(False)
+
+    def _encoder_changed(self, _idx: int) -> None:
+        enc = self.encoder_combo.currentData()
+        if enc:
+            self.state.set_encoder(enc)
+            self.log(f"Encoder set to {ENCODER_LABELS.get(enc, enc)}")
+
+    def _detect_encoders(self) -> None:
+        ok, _ = self.state.binaries_ok()
+        if not ok:
+            self.log("Can't detect encoders — ffmpeg not found.")
+            return
+        self.redetect_btn.setEnabled(False)
+        self.log("Testing hardware encoders (this runs ffmpeg, give it a sec)…")
+        worker = FnWorker(self.state.detect_encoders)
+        worker.signals.done.connect(self._on_encoders_detected)
+        self.pool.start(worker)
+
+    def _on_encoders_detected(self, result, error: str) -> None:
+        self.redetect_btn.setEnabled(True)
+        if error or not result:
+            self.log(f"Encoder detection failed: {error}")
+            return
+        self._populate_encoders(result)
+        labels = ", ".join(ENCODER_LABELS.get(e, e) for e in result)
+        self.log(f"Working encoders: {labels}  →  using "
+                 f"{ENCODER_LABELS.get(self.state.encoder, self.state.encoder)}")
 
     def _open_settings(self) -> None:
         dlg = SettingsDialog(self.state, self)

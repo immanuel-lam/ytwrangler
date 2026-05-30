@@ -158,7 +158,9 @@ class SingleTab(QWidget):
             return
         self.state.refresh_binaries()
         self.cancel_event = threading.Event()
-        mode = "audio" if self.kind.currentText().startswith("Audio") else "video"
+        # "Video (MP4)" keeps audio (combined); the format selector below still
+        # lets you pick a video-only stream if that's what you want.
+        mode = "audio" if self.kind.currentText().startswith("Audio") else "both"
         job = {"url": url, "mode": mode, "force_h264": self.force.isChecked(),
                "fmt": None if mode == "audio" else self.fmt.text().strip()}
         ctx = self.state.ctx(self.out_label.text())

@@ -171,6 +171,11 @@ def _ytdlp_download(ctx: dict, url: str, fmt: str, extra: list[str], tmp: Path,
         m = _PERCENT_RE.search(line)
         if m:
             on_progress(float(m.group(1)), f"{phase} {m.group(1)}%")
+        elif line.startswith(("[ExtractAudio]", "[Merger]",
+                              "[VideoConvertor]", "[Fixup")):
+            # yt-dlp is running ffmpeg internally — download is done but this
+            # can take a while, so don't leave the UI stuck at "100%".
+            on_progress(100, "Processing (ffmpeg)…")
 
     on_progress(0, phase)
     rc = run_stream(cmd, handle, should_cancel, on_log)
@@ -205,40 +210,48 @@ def _convert_to_mp4(ctx: dict, src: Path, force_h264: bool,
                     should_cancel: CancelCb) -> Path:
     vcodec, acodec = probe_codecs(ctx["ffprobe"], src)
     duration = probe_duration(ctx["ffprobe"], src)
-    args = [ctx["ffmpeg"], "-hide_banner", "-loglevel", "error", "-nostats",
-            "-progress", "pipe:1", "-y", "-i", str(src)]
+    need_reencode = force_h264 or vcodec not in ("h264", "avc1")
+    dest = _collision_free(Path(ctx["out_dir"]), src.stem + ".mp4")
 
-    if force_h264 or vcodec not in ("h264", "avc1"):
-        enc = ctx["encoder"]
-        on_log(f"Re-encoding video ({vcodec} -> h264) with {enc}")
-        args += ["-c:v", enc] + ENCODER_ARGS.get(enc, ENCODER_ARGS["libx264"])
+    def build(encoder: str) -> list[str]:
+        args = [ctx["ffmpeg"], "-hide_banner", "-loglevel", "error", "-nostats",
+                "-progress", "pipe:1", "-y", "-i", str(src)]
+        if need_reencode:
+            args += ["-c:v", encoder] + ENCODER_ARGS.get(
+                encoder, ENCODER_ARGS["libx264"])
+        else:
+            args += ["-c:v", "copy"]
+        if acodec is None:
+            args += ["-an"]                      # video-only source: no audio
+        elif acodec == "aac":
+            args += ["-c:a", "copy"]
+        else:
+            # MP4 + Opus is the bug we hit earlier; always normalize to AAC.
+            args += ["-c:a", "aac", "-b:a", "192k"]
+        args += ["-movflags", "+faststart", str(dest)]
+        return args
+
+    if need_reencode:
+        on_log(f"Re-encoding video ({vcodec} -> h264) with {ctx['encoder']}")
     else:
         on_log("Video is already H.264 — copying stream (instant)")
-        args += ["-c:v", "copy"]
 
-    if acodec == "aac":
-        args += ["-c:a", "copy"]
-    else:
-        # MP4 + Opus is the bug we hit earlier; always normalize to AAC.
-        on_log(f"Converting audio ({acodec} -> aac) for MP4 compatibility")
-        args += ["-c:a", "aac", "-b:a", "192k"]
-
-    dest = _collision_free(Path(ctx["out_dir"]), src.stem + ".mp4")
-    args += ["-movflags", "+faststart", str(dest)]
-    _run_ffmpeg(args, duration, "Converting", on_progress, on_log, should_cancel)
-    on_log(f"Saved {dest}")
-    return dest
-
-
-def _extract_mp3(ctx: dict, src: Path, on_progress: ProgressCb, on_log: LogCb,
-                 should_cancel: CancelCb) -> Path:
-    duration = probe_duration(ctx["ffprobe"], src)
-    dest = _collision_free(Path(ctx["out_dir"]), src.stem + ".mp3")
-    args = [ctx["ffmpeg"], "-hide_banner", "-loglevel", "error", "-nostats",
-            "-progress", "pipe:1", "-y", "-i", str(src),
-            "-vn", "-c:a", "libmp3lame", "-q:a", "2", str(dest)]
-    _run_ffmpeg(args, duration, "Extracting audio", on_progress, on_log,
-                should_cancel)
+    try:
+        _run_ffmpeg(build(ctx["encoder"]), duration, "Converting",
+                    on_progress, on_log, should_cancel)
+    except RuntimeError as e:
+        # Hardware encoder can be advertised but fail at runtime (e.g. NVENC on
+        # a GeForce 930MX). Fall back to software so the download isn't lost.
+        if need_reencode and ctx["encoder"] != "libx264":
+            on_log(f"{ctx['encoder']} failed ({e}); retrying with libx264…")
+            try:
+                dest.unlink()
+            except OSError:
+                pass
+            _run_ffmpeg(build("libx264"), duration, "Converting (libx264)",
+                        on_progress, on_log, should_cancel)
+        else:
+            raise
     on_log(f"Saved {dest}")
     return dest
 
@@ -253,7 +266,10 @@ def process_item(ctx: dict, url: str, mode: str, force_h264: bool = False,
                  should_cancel: CancelCb | None = None) -> list[Path]:
     """Download + convert one URL.
 
-    mode: 'audio' | 'video' | 'both'
+    mode:
+      'audio' -> audio only, saved as MP3
+      'video' -> video only (no audio track), saved as MP4
+      'both'  -> combined video + audio, saved as one MP4
     Returns the list of produced output paths.
     """
     on_progress = on_progress or (lambda p, s: None)
@@ -273,17 +289,15 @@ def process_item(ctx: dict, url: str, mode: str, force_h264: bool = False,
             on_log(f"Saved {dest}")
             produced.append(dest)
         else:
-            # video or both: download once, then convert (and maybe extract mp3)
-            _ytdlp_download(ctx, url, fmt or "bv*+ba/b",
+            # 'video' = video-only stream; 'both' = video + audio merged.
+            default_fmt = "bv*" if mode == "video" else "bv*+ba/b"
+            _ytdlp_download(ctx, url, fmt or default_fmt,
                             ["--merge-output-format", "mkv"],
                             tmp, on_progress, on_log, should_cancel, "Downloading")
             src = _newest_output(tmp)
             produced.append(
                 _convert_to_mp4(ctx, src, force_h264, on_progress, on_log,
                                 should_cancel))
-            if mode == "both":
-                produced.append(
-                    _extract_mp3(ctx, src, on_progress, on_log, should_cancel))
         on_progress(100, "Done")
         return produced
     finally:

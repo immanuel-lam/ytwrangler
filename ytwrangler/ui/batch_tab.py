@@ -14,7 +14,10 @@ from PySide6.QtWidgets import (
 from ..session import AppState
 from ..workers import DownloadWorker
 
-MODES = ["video", "audio", "both"]
+MODES = ["both", "video", "audio"]
+MODE_TOOLTIP = ("both = video + audio in one MP4\n"
+                "video = video only, no audio (MP4)\n"
+                "audio = audio only (MP3)")
 COL_URL, COL_MODE, COL_FORCE, COL_STATUS = range(4)
 
 
@@ -44,6 +47,7 @@ class BatchTab(QWidget):
         side = QVBoxLayout()
         self.default_mode = QComboBox()
         self.default_mode.addItems(MODES)
+        self.default_mode.setToolTip(MODE_TOOLTIP)
         side.addWidget(QLabel("New links as:"))
         side.addWidget(self.default_mode)
         add_btn = QPushButton("Add ↓")
@@ -115,7 +119,8 @@ class BatchTab(QWidget):
 
         combo = QComboBox()
         combo.addItems(MODES)
-        combo.setCurrentText(mode if mode in MODES else "video")
+        combo.setCurrentText(mode if mode in MODES else "both")
+        combo.setToolTip(MODE_TOOLTIP)
         combo.currentTextChanged.connect(self._persist)
         self.table.setCellWidget(r, COL_MODE, combo)
 

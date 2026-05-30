@@ -19,6 +19,15 @@ ENCODER_ARGS: dict[str, list[str]] = {
     "libx264": ["-crf", "20", "-preset", "medium"],            # software fallback
 }
 
+# Human-friendly names for the encoder picker.
+ENCODER_LABELS: dict[str, str] = {
+    "h264_videotoolbox": "VideoToolbox (Apple)",
+    "h264_nvenc": "NVENC (Nvidia)",
+    "h264_qsv": "QuickSync (Intel HD)",
+    "h264_amf": "AMF (AMD)",
+    "libx264": "Software (libx264)",
+}
+
 # Common install locations to probe if a binary isn't on PATH.
 _EXTRA_PATHS = [
     "/opt/homebrew/bin",
@@ -61,27 +70,63 @@ def ffprobe_for(ffmpeg_path: str | None) -> str | None:
     return find_binary("ffprobe")
 
 
-def detect_h264_encoder(ffmpeg_path: str | None) -> str:
-    """Pick the best available hardware H.264 encoder, else libx264."""
-    if not ffmpeg_path:
-        return "libx264"
+def _platform_priority() -> list[str]:
+    system = platform.system()
+    if system == "Darwin":
+        return ["h264_videotoolbox"]
+    if system == "Windows":
+        return ["h264_nvenc", "h264_qsv", "h264_amf"]
+    return ["h264_nvenc", "h264_qsv"]  # Linux / other
+
+
+def _listed_encoders(ffmpeg_path: str) -> str:
     try:
-        out = subprocess.run(
+        return subprocess.run(
             [ffmpeg_path, "-hide_banner", "-encoders"],
             capture_output=True, text=True, timeout=15,
         ).stdout
     except Exception:
-        return "libx264"
+        return ""
 
-    system = platform.system()
-    if system == "Darwin":
-        priority = ["h264_videotoolbox"]
-    elif system == "Windows":
-        priority = ["h264_nvenc", "h264_qsv", "h264_amf"]
-    else:  # Linux / other — only auto-pick encoders that need no device setup
-        priority = ["h264_nvenc"]
 
-    for enc in priority:
-        if enc in out:
-            return enc
-    return "libx264"
+def _encoder_works(ffmpeg_path: str, encoder: str) -> bool:
+    """Actually try a tiny encode. `ffmpeg -encoders` lists hardware encoders
+    even when the GPU can't use them (e.g. NVENC on a GeForce 930MX), so the
+    only reliable check is to run one."""
+    cmd = [
+        ffmpeg_path, "-hide_banner", "-loglevel", "error",
+        "-f", "lavfi", "-i", "color=c=black:s=128x72:d=0.1",
+        "-frames:v", "1", "-c:v", encoder, "-f", "null", "-",
+    ]
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=25,
+                           **_run_kwargs())
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _run_kwargs() -> dict:
+    # Don't pop a console window on Windows.
+    if os.name == "nt":
+        return {"creationflags": 0x08000000}
+    return {}
+
+
+def test_h264_encoders(ffmpeg_path: str | None) -> list[str]:
+    """Return the H.264 encoders that actually work on this machine, best
+    first. libx264 is always included as a guaranteed fallback."""
+    if not ffmpeg_path:
+        return ["libx264"]
+    listed = _listed_encoders(ffmpeg_path)
+    candidates = [e for e in _platform_priority() if e in listed]
+    candidates.append("libx264")
+    working = [e for e in candidates if _encoder_works(ffmpeg_path, e)]
+    if "libx264" not in working:
+        working.append("libx264")  # last-resort, assume software always works
+    return working
+
+
+def detect_h264_encoder(ffmpeg_path: str | None) -> str:
+    """Best working H.264 encoder (tests them), else libx264."""
+    return test_h264_encoders(ffmpeg_path)[0]
