@@ -72,9 +72,13 @@ class BatchTab(QWidget):
         tools = QHBoxLayout()
         rm_btn = QPushButton("Remove selected")
         rm_btn.clicked.connect(self._remove_selected)
+        redl_btn = QPushButton("Re-download selected")
+        redl_btn.setToolTip("Clear the completed flag so these run again on Start")
+        redl_btn.clicked.connect(self._redownload_selected)
         clr_btn = QPushButton("Clear all")
         clr_btn.clicked.connect(self._clear_all)
         tools.addWidget(rm_btn)
+        tools.addWidget(redl_btn)
         tools.addWidget(clr_btn)
         tools.addStretch(1)
         root.addLayout(tools)
@@ -102,6 +106,11 @@ class BatchTab(QWidget):
 
         # start/stop
         run_row = QHBoxLayout()
+        self.redownload_all = QCheckBox("Re-download completed")
+        self.redownload_all.setToolTip(
+            "Ignore the completed flag and download every link again "
+            "(this WILL re-contact YouTube for finished items)")
+        run_row.addWidget(self.redownload_all)
         self.start_btn = QPushButton("▶  Start")
         self.start_btn.clicked.connect(self._start)
         self.stop_btn = QPushButton("■  Stop")
@@ -112,10 +121,22 @@ class BatchTab(QWidget):
         root.addLayout(run_row)
 
     # ------------------------------------------------------------- items -- #
-    def _add_row_widget(self, url: str, mode: str, force: bool) -> None:
+    def _set_done(self, row: int, done: bool) -> None:
+        item = self.table.item(row, COL_URL)
+        if item:
+            item.setData(Qt.UserRole, bool(done))
+
+    def _is_done(self, row: int) -> bool:
+        item = self.table.item(row, COL_URL)
+        return bool(item.data(Qt.UserRole)) if item else False
+
+    def _add_row_widget(self, url: str, mode: str, force: bool,
+                        done: bool = False) -> None:
         r = self.table.rowCount()
         self.table.insertRow(r)
-        self.table.setItem(r, COL_URL, QTableWidgetItem(url))
+        url_item = QTableWidgetItem(url)
+        url_item.setData(Qt.UserRole, bool(done))
+        self.table.setItem(r, COL_URL, url_item)
 
         combo = QComboBox()
         combo.addItems(MODES)
@@ -131,8 +152,12 @@ class BatchTab(QWidget):
         self.table.setCellWidget(r, COL_FORCE, cb)
 
         bar = QProgressBar()
-        bar.setValue(0)
-        bar.setFormat("queued")
+        if done:
+            bar.setValue(100)
+            bar.setFormat("✓ completed")
+        else:
+            bar.setValue(0)
+            bar.setFormat("queued")
         self.table.setCellWidget(r, COL_STATUS, bar)
 
     def _add_links(self) -> None:
@@ -162,23 +187,40 @@ class BatchTab(QWidget):
 
     def _load_items(self) -> None:
         for it in self.state.data.get("items", []):
-            self._add_row_widget(it.get("url", ""), it.get("mode", "video"),
-                                 it.get("force_h264", False))
+            self._add_row_widget(it.get("url", ""), it.get("mode", "both"),
+                                 it.get("force_h264", False),
+                                 it.get("done", False))
+
+    def _row_job(self, r: int) -> dict | None:
+        url_item = self.table.item(r, COL_URL)
+        if not url_item:
+            return None
+        combo = self.table.cellWidget(r, COL_MODE)
+        cb = self.table.cellWidget(r, COL_FORCE)
+        return {
+            "url": url_item.text(),
+            "mode": combo.currentText() if combo else "both",
+            "force_h264": cb.isChecked() if cb else False,
+        }
 
     def _collect_items(self) -> list[dict]:
         items = []
         for r in range(self.table.rowCount()):
-            url_item = self.table.item(r, COL_URL)
-            combo = self.table.cellWidget(r, COL_MODE)
-            cb = self.table.cellWidget(r, COL_FORCE)
-            if not url_item:
+            job = self._row_job(r)
+            if job is None:
                 continue
-            items.append({
-                "url": url_item.text(),
-                "mode": combo.currentText() if combo else "video",
-                "force_h264": cb.isChecked() if cb else False,
-            })
+            job["done"] = self._is_done(r)
+            items.append(job)
         return items
+
+    def _redownload_selected(self) -> None:
+        rows = {i.row() for i in self.table.selectedIndexes()}
+        for r in rows:
+            self._set_done(r, False)
+            self._set_status(r, 0, "queued")
+        if rows:
+            self._persist()
+            self.log(f"Reset {len(rows)} link(s) to re-download on next Start.")
 
     # --------------------------------------------------------- settings -- #
     def _choose_out(self) -> None:
@@ -207,25 +249,48 @@ class BatchTab(QWidget):
         if not ok:
             self.log(f"Cannot start — {msg}")
             return
-        items = self._collect_items()
-        if not items:
+        if self.table.rowCount() == 0:
             self.log("Nothing to download — add some links first.")
             return
         self._persist()
         self.state.refresh_binaries()  # pick up any path changes
 
+        # Build the run list, skipping already-completed links so we don't
+        # re-contact YouTube for them (avoids needless rate-limit risk).
+        ignore_done = self.redownload_all.isChecked()
+        run_list: list[tuple[int, dict]] = []
+        skipped = 0
+        for r in range(self.table.rowCount()):
+            job = self._row_job(r)
+            if job is None:
+                continue
+            if self._is_done(r) and not ignore_done:
+                skipped += 1
+                continue
+            run_list.append((r, job))
+
+        if skipped:
+            self.log(f"Skipping {skipped} already-completed link(s).")
+        if not run_list:
+            self.log("All links already completed — nothing to do. "
+                     "(Use 'Re-download' to run them again.)")
+            return
+
         self.cancel_event = threading.Event()
         self.pool.setMaxThreadCount(self.conc.value())
-        self._total = len(items)
+        self._total = len(run_list)
         self._done = 0
         ctx = self.state.ctx(self.out_label.text())
+        # Downloads run in parallel, but encoding is compute-bound — share one
+        # lock so only a single video re-encode happens at a time.
+        ctx["encode_lock"] = threading.Lock()
 
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self.log(f"Starting {self._total} download(s), "
                  f"{self.conc.value()} at a time…")
 
-        for row, job in enumerate(items):
+        for row, job in run_list:
             self._set_status(row, 0, "queued")
             worker = DownloadWorker(row, job, ctx, self.cancel_event.is_set)
             worker.signals.progress.connect(self._set_status)
@@ -240,7 +305,14 @@ class BatchTab(QWidget):
         self.stop_btn.setEnabled(False)
 
     def _on_finished(self, row: int, ok: bool, message: str) -> None:
-        self._set_status(row, 100 if ok else 0, "✓ " + message if ok else message)
+        if ok:
+            # Mark completed and persist immediately, so the status survives a
+            # crash/close and we skip this link on the next run.
+            self._set_done(row, True)
+            self._set_status(row, 100, "✓ completed")
+            self._persist()
+        else:
+            self._set_status(row, 0, message)
         self.log(f"[row {row + 1}] {message}")
         self._done += 1
         if self._done >= self._total:

@@ -231,27 +231,41 @@ def _convert_to_mp4(ctx: dict, src: Path, force_h264: bool,
         args += ["-movflags", "+faststart", str(dest)]
         return args
 
-    if need_reencode:
-        on_log(f"Re-encoding video ({vcodec} -> h264) with {ctx['encoder']}")
-    else:
+    if not need_reencode:
+        # Remux/copy is I/O-cheap, so let these run in parallel (no lock).
         on_log("Video is already H.264 — copying stream (instant)")
-
-    try:
         _run_ffmpeg(build(ctx["encoder"]), duration, "Converting",
                     on_progress, on_log, should_cancel)
-    except RuntimeError as e:
-        # Hardware encoder can be advertised but fail at runtime (e.g. NVENC on
-        # a GeForce 930MX). Fall back to software so the download isn't lost.
-        if need_reencode and ctx["encoder"] != "libx264":
-            on_log(f"{ctx['encoder']} failed ({e}); retrying with libx264…")
-            try:
-                dest.unlink()
-            except OSError:
-                pass
-            _run_ffmpeg(build("libx264"), duration, "Converting (libx264)",
+        on_log(f"Saved {dest}")
+        return dest
+
+    # Re-encoding is compute-bound. Serialize it with a shared lock so we never
+    # run multiple encodes at once (downloads still run in parallel).
+    on_log(f"Re-encoding video ({vcodec} -> h264) with {ctx['encoder']}")
+    lock = ctx.get("encode_lock")
+    if lock is not None and not lock.acquire(blocking=False):
+        on_progress(100, "Waiting for encoder…")
+        lock.acquire()  # block until the encoder is free
+    try:
+        try:
+            _run_ffmpeg(build(ctx["encoder"]), duration, "Converting",
                         on_progress, on_log, should_cancel)
-        else:
-            raise
+        except RuntimeError as e:
+            # Hardware encoder can be advertised but fail at runtime (e.g. NVENC
+            # on a GeForce 930MX). Fall back to software so the file isn't lost.
+            if ctx["encoder"] != "libx264":
+                on_log(f"{ctx['encoder']} failed ({e}); retrying with libx264…")
+                try:
+                    dest.unlink()
+                except OSError:
+                    pass
+                _run_ffmpeg(build("libx264"), duration, "Converting (libx264)",
+                            on_progress, on_log, should_cancel)
+            else:
+                raise
+    finally:
+        if lock is not None:
+            lock.release()
     on_log(f"Saved {dest}")
     return dest
 
